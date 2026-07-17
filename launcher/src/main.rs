@@ -1,16 +1,11 @@
-//! mDNS launcher for the MPI demo.
+//! Launcher for the MPI demo.
 //!
-//! Discovers MPI nodes on the local network via mDNS, writes an OpenMPI
-//! hostfile, and launches mpirun. No managed service, single LAN only.
+//! Workers run `advertise` to display their IP; the presenter runs `run`
+//! and types in each IP. No mDNS or multicast required.
 //!
 //! Usage:
 //!     launcher advertise                 # on each worker node
 //!     launcher run [mpirun args...]      # on the coordinator (rank 0)
-//!
-//! Examples:
-//!     launcher advertise
-//!     launcher run --mca btl_tcp_if_include 192.168.1.0/24
-//!     launcher run --binary /workspace/demonstration/demonstration
 
 use std::collections::BTreeSet;
 use std::error::Error;
