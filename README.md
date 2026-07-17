@@ -160,7 +160,7 @@ CI images and local images will no longer interoperate:
 
 ```sh
 ssh-keygen -t ed25519 -N "" -C mpi-demo-key -f ssh/id_ed25519
-gh secret set MPI_SSH_PRIVATE_KEY < ssh/id_ed25519
+gh secret set SSH_PRIVATE_KEY < ssh/id_ed25519
 ```
 
 Set the secret from the file as shown rather than pasting it: a paste can drop the
@@ -174,9 +174,15 @@ Keep a copy somewhere safe; it cannot be recovered from the tracked public key.
 
 `.github/workflows/docker.yml` builds for `linux/amd64` and `linux/arm64` and pushes
 to `ghcr.io/<owner>/<repo>` on every branch and tag; pull requests build without
-pushing. It reads the private key from the repository secret **`MPI_SSH_PRIVATE_KEY`**
-and passes it to the build as the `ssh_private_key` build secret, so you need to set
-that secret before the first run.
+pushing. It reads the private key from the repository secret **`SSH_PRIVATE_KEY`** and
+passes it to the build as the `ssh_private_key` build secret, so you need to set that
+secret before the first run.
+
+Each architecture builds on its own native runner — `ubuntu-latest` for amd64,
+`ubuntu-24.04-arm` for arm64 — rather than emulating arm64 under QEMU. Because a
+runner can only build its own architecture, the two jobs push by digest only and a
+final `merge` job joins those digests into one multi-arch manifest. That is what makes
+a plain `docker pull` of a tag resolve to the right architecture.
 
 ## License
 
