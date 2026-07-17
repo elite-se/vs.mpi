@@ -13,13 +13,14 @@ docker run -it --net=host ghcr.io/elite-se/vs.mpi
 
 The launcher menu opens automatically. Students select **advertise**; the presenter selects **run**, waits until all nodes appear in the list, then presses Enter to start. Each node's log streams in the terminal and is also visible in Docker Desktop.
 
-**Windows note:** Docker Desktop on Windows runs containers inside WSL2, so the IP shown inside the container may be a WSL-internal address (`192.168.65.x`) instead of the real LAN address. This breaks the mDNS discovery. There are two options:
+**Windows note:** Docker Desktop on Windows runs containers inside WSL2, so the IP shown inside the container may be a WSL-internal address (`192.168.65.x`) instead of the real LAN address. This breaks mDNS discovery. There are three options:
 
-- Run the following in PowerShell to find the correct IP:
-   > ```powershell
-   > irm https://raw.githubusercontent.com/elite-se/vs.mpi/main/get-ip.ps1 | iex
-   > ```
-- Alternativley you can also change WSL's config to mirrored networking in WSL2, see [the docs](https://learn.microsoft.com/en-us/windows/wsl/wsl-config#wslconf).
+- **Manual IP entry** — if mDNS fails, `run` falls back to a prompt where the presenter types each node's IP by hand. Students can find their LAN IP with:
+  ```powershell
+  Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass; irm https://raw.githubusercontent.com/elite-se/vs.mpi/main/get-ip.ps1 | iex
+  ```
+- **Mirrored networking** — enable mirrored networking in WSL2 to restore mDNS, see [the docs](https://learn.microsoft.com/en-us/windows/wsl/wsl-config#wslconf).
+- **Use Linux or macOS** — mDNS works out of the box on both.
 
 ### Local Fallback
 

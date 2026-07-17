@@ -1,7 +1,11 @@
 //! Launcher for the MPI demo.
 //!
-//! Workers run `advertise` to display their IP; the presenter runs `run`
-//! and types in each IP. No mDNS or multicast required.
+//! The presenter runs `run`, which opens a small webserver on port 8080.
+//! Workers run `advertise`, type in the presenter's IP, and hit that
+//! webserver once to register themselves; `run` reads the connecting
+//! peer's address off the socket and remembers it. No mDNS or multicast
+//! required — since containers are started with `--net=host`, the peer
+//! address the presenter observes is the worker's real LAN address.
 //!
 //! Usage:
 //!     launcher advertise                 # on each worker node
@@ -10,8 +14,8 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fs;
-use std::io::{self, BufRead, Write};
-use std::net::UdpSocket;
+use std::io::{self, BufRead, Read, Write};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -19,16 +23,14 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use crossterm::{cursor, execute, terminal};
-use crossterm::event::{read as ct_read, Event, KeyCode};
+use crossterm::event::{read as ct_read, Event, KeyCode, KeyModifiers};
 use crossterm::style::Print;
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 
-const SERVICE_TYPE: &str = "_mpi._tcp.local.";
 const HOSTFILE: &str = "/tmp/mpi-hosts.txt";
-const PORT: u16 = 4242; // only identifies the advert; MPI does not use it
+const PORT: u16 = 8080;
 
 #[derive(Parser)]
-#[command(about = "mDNS launcher for the MPI demo")]
+#[command(about = "launcher for the MPI demo")]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -36,8 +38,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Publish this node on the LAN.
-    Advertise,
+    /// Register this node with the presenter.
+    Advertise {
+        /// IP address of the presenter (running `run`).
+        #[arg(long)]
+        presenter: Option<String>,
+    },
     /// Discover nodes, write hostfile, launch mpirun.
     Run {
         /// MPI binary to execute on all nodes.
@@ -73,32 +79,33 @@ fn local_ip() -> String {
     }
 }
 
-/// Publish this machine on the LAN until interrupted.
-fn advertise() -> Result<(), Box<dyn Error>> {
-    let daemon = ServiceDaemon::new()?;
-    let host = gethostname::gethostname().to_string_lossy().into_owned();
+/// Register this machine with the presenter's webserver, then idle until interrupted.
+fn advertise(presenter: Option<String>) -> Result<(), Box<dyn Error>> {
+    let presenter = match presenter {
+        Some(p) => p,
+        None => prompt_required("Presenter IP")?,
+    };
     let ip = local_ip();
 
-    let info = ServiceInfo::new(
-        SERVICE_TYPE,
-        &format!("mpi-{host}"),
-        &format!("{host}.local."),
-        ip.as_str(),
-        PORT,
-        &[("role", "mpi-node")][..],
-    )?;
-    let fullname = info.get_fullname().to_string();
-    daemon.register(info)?;
-    println!("Advertising mpi-{host} ({ip}) as {SERVICE_TYPE}. Ctrl-C to stop.");
+    match TcpStream::connect((presenter.as_str(), PORT)) {
+        Ok(mut stream) => {
+            let _ = stream.write_all(
+                format!("GET /register HTTP/1.1\r\nHost: {presenter}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            );
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf);
+            println!("Registered with presenter {presenter}:{PORT} as {ip}.");
+        }
+        Err(e) => {
+            eprintln!("Could not reach presenter {presenter}:{PORT}: {e}");
+        }
+    }
+
     println!("\n--- /tmp/demo.log ---");
     thread::spawn(|| tail_log("/tmp/demo.log"));
 
     wait_for_ctrl_c();
-
-    if let Ok(rx) = daemon.unregister(&fullname) {
-        let _ = rx.recv();
-    }
-    let _ = daemon.shutdown();
     Ok(())
 }
 
@@ -113,8 +120,22 @@ fn wait_for_ctrl_c() {
 
 /// Discover nodes, write the hostfile, and launch mpirun.
 fn run(binary: String, mut passthrough: Vec<String>) -> Result<(), Box<dyn Error>> {
-    let daemon = ServiceDaemon::new()?;
-    let mdns_rx = daemon.browse(SERVICE_TYPE)?;
+    let listener = TcpListener::bind(("0.0.0.0", PORT))?;
+    let (reg_tx, reg_rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let peer = stream.peer_addr().ok().map(|a| a.ip().to_string());
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+            );
+            if let Some(ip) = peer {
+                let _ = reg_tx.send(ip);
+            }
+        }
+    });
 
     // Signal when the user presses Enter.
     let (enter_tx, enter_rx) = mpsc::channel::<()>();
@@ -127,32 +148,20 @@ fn run(binary: String, mut passthrough: Vec<String>) -> Result<(), Box<dyn Error
     let me = local_ip();
     let mut discovered: BTreeSet<String> = BTreeSet::new();
 
-    println!("Browsing {SERVICE_TYPE} — press Enter when all nodes are visible.\n");
+    println!("Listening on 0.0.0.0:{PORT} — tell each worker to `advertise` to {me}.");
+    println!("Press Enter when all nodes are visible.\n");
 
     let mut prev_lines: u16 = 0;
     loop {
-        // Drain mDNS events for up to one second.
+        // Drain registrations for up to one second.
         let tick = Instant::now() + Duration::from_secs(1);
         loop {
             let now = Instant::now();
             if now >= tick { break; }
-            match mdns_rx.recv_timeout(tick - now) {
-                Ok(ServiceEvent::ServiceResolved(info)) => {
-                    // Prefer an IPv4 address; fall back to the advertised hostname.
-                    let host = info
-                        .get_addresses_v4()
-                        .iter()
-                        .min()
-                        .map(|a| a.to_string())
-                        .or_else(|| {
-                            let name = info.get_hostname().trim_end_matches('.');
-                            (!name.is_empty()).then(|| name.to_string())
-                        });
-                    if let Some(host) = host {
-                        discovered.insert(host);
-                    }
+            match reg_rx.recv_timeout(tick - now) {
+                Ok(ip) => {
+                    discovered.insert(ip);
                 }
-                Ok(_) => {}
                 Err(_) => break,
             }
         }
@@ -184,7 +193,17 @@ fn run(binary: String, mut passthrough: Vec<String>) -> Result<(), Box<dyn Error
         }
     }
 
-    let _ = daemon.shutdown();
+    // Allow the presenter to add any nodes that failed to register (e.g. blocked port).
+    println!("Add missing node IPs (one per line, blank to continue):");
+    loop {
+        print!("  IP: ");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        io::stdin().lock().read_line(&mut line)?;
+        let ip = line.trim().to_string();
+        if ip.is_empty() { break; }
+        discovered.insert(ip);
+    }
 
     // This machine is rank 0, so it goes first; then every discovered peer.
     let me = local_ip();
@@ -377,8 +396,8 @@ fn prompt_required(label: &str) -> Result<String, Box<dyn Error>> {
 
 fn interactive_menu(initial_sel: usize) -> Result<Cmd, Box<dyn Error>> {
     const OPTIONS: &[(&str, &str)] = &[
-        ("advertise", "Publish this node on the LAN via mDNS"),
-        ("run",       "Discover LAN nodes and launch mpirun"),
+        ("advertise", "Register this node with the presenter"),
+        ("run",       "Wait for nodes to register and launch mpirun"),
         ("local",     "Start local Docker containers (fallback demo)"),
     ];
 
@@ -415,6 +434,14 @@ fn interactive_menu(initial_sel: usize) -> Result<Cmd, Box<dyn Error>> {
                     execute!(stdout, cursor::Show)?;
                     std::process::exit(0);
                 }
+                // Raw mode disables automatic signal generation (ISIG), so
+                // Ctrl-C arrives here as a plain key event instead of SIGINT.
+                // Handle it explicitly so the menu is always killable.
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    terminal::disable_raw_mode()?;
+                    execute!(stdout, cursor::Show)?;
+                    std::process::exit(130);
+                }
                 _ => continue,
             }
             execute!(
@@ -432,7 +459,10 @@ fn interactive_menu(initial_sel: usize) -> Result<Cmd, Box<dyn Error>> {
     println!("\r\n");
 
     match selected {
-        0 => Ok(Cmd::Advertise),
+        0 => {
+            let presenter = prompt_required("Presenter IP")?;
+            Ok(Cmd::Advertise { presenter: Some(presenter) })
+        }
         1 => {
             let binary = prompt("Binary", "./demonstration/demonstration")?;
             let args_str = prompt("Extra mpirun args (space-separated, blank for none)", "")?;
@@ -472,7 +502,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     loop {
         match cmd {
-            Cmd::Advertise => return advertise(),
+            Cmd::Advertise { presenter } => return advertise(presenter),
             Cmd::Run { binary, mpirun_args } => {
                 run(binary, mpirun_args)?;
                 cmd = interactive_menu(1)?;
