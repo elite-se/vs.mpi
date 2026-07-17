@@ -2,19 +2,18 @@
 # Build-time setup of the shared demo SSH keypair for the `mpi` user.
 #
 # mpirun reaches the other nodes over ssh, so every node needs the same key and
-# has to trust it. The private key comes in as a BuildKit secret: the mount
-# leaves no layer behind, but the key written from it does, so it ships in the
-# image and must be treated as public. See README.md.
+# has to trust it. The key is read from ssh/id_ed25519 in the build context,
+# which must be present before building — either committed locally or written
+# by CI from the SSH_PRIVATE_KEY repository secret.
 set -e
 
-secret=/run/secrets/ssh_private_key
+secret=/workspace/ssh/id_ed25519
 ssh_dir=/home/mpi/.ssh
 
 if [ ! -s "$secret" ]; then
-    echo 'ERROR: the ssh_private_key build secret is empty or missing.' >&2
-    echo '       In CI, check the SSH_PRIVATE_KEY repository secret is set.' >&2
-    echo '       Locally, build with:' >&2
-    echo '       docker build --secret id=ssh_private_key,src=ssh/id_ed25519 .' >&2
+    echo 'ERROR: ssh/id_ed25519 is missing or empty.' >&2
+    echo '       Generate a keypair with:' >&2
+    echo '       ssh-keygen -t ed25519 -f ssh/id_ed25519 -N ""' >&2
     exit 1
 fi
 
@@ -27,9 +26,8 @@ awk '{ sub(/\r$/, ""); print }' "$secret" > "$ssh_dir/id_ed25519"
 chmod 600 "$ssh_dir/id_ed25519"
 
 if ! ssh-keygen -y -f "$ssh_dir/id_ed25519" > "$ssh_dir/id_ed25519.pub"; then
-    echo 'ERROR: the ssh_private_key build secret is not a valid OpenSSH private key.' >&2
-    echo '       Set it from the file rather than pasting it:' >&2
-    echo '       gh secret set SSH_PRIVATE_KEY < ssh/id_ed25519' >&2
+    echo 'ERROR: ssh/id_ed25519 is not a valid OpenSSH private key.' >&2
+    echo '       Regenerate with: ssh-keygen -t ed25519 -f ssh/id_ed25519 -N ""' >&2
     exit 1
 fi
 

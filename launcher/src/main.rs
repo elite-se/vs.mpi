@@ -9,15 +9,17 @@
 //!
 //! Examples:
 //!     launcher advertise
-//!     launcher run --mca btl_tcp_if_include 192.168.1.0/24 \
-//!                  /home/user/demo/target/release/demonstration
+//!     launcher run --mca btl_tcp_if_include 192.168.1.0/24
+//!     launcher run --binary /workspace/demonstration/demonstration
 
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fs;
+use std::io::{self, BufRead, Write};
 use std::net::UdpSocket;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
@@ -40,9 +42,24 @@ enum Cmd {
     Advertise,
     /// Discover nodes, write hostfile, launch mpirun.
     Run {
-        /// Arguments passed through to mpirun (e.g. the binary path).
+        /// MPI binary to execute on all nodes.
+        #[arg(long, default_value = "./demonstration/demonstration")]
+        binary: String,
+        /// Extra arguments forwarded to mpirun before the binary (e.g. --mca flags).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         mpirun_args: Vec<String>,
+    },
+    /// Start local Docker containers as a self-contained fallback demo.
+    Local {
+        /// Docker image to start containers from (e.g. ghcr.io/org/repo:latest).
+        #[arg(long)]
+        image: String,
+        /// Number of containers (MPI processes) to start.
+        #[arg(long, default_value_t = 11usize)]
+        count: usize,
+        /// MPI binary to execute inside the containers.
+        #[arg(long, default_value = "/workspace/demonstration/demonstration")]
+        binary: String,
     },
 }
 
@@ -95,7 +112,7 @@ fn wait_for_ctrl_c() {
 }
 
 /// Discover nodes, write the hostfile, and launch mpirun.
-fn run(mut passthrough: Vec<String>) -> Result<(), Box<dyn Error>> {
+fn run(binary: String, mut passthrough: Vec<String>) -> Result<(), Box<dyn Error>> {
     let secs: f64 = std::env::var("DISCOVER_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -159,6 +176,7 @@ fn run(mut passthrough: Vec<String>) -> Result<(), Box<dyn Error>> {
     let args: Vec<&str> = ["--hostfile", HOSTFILE, "-np", &np]
         .into_iter()
         .chain(passthrough.iter().map(String::as_str))
+        .chain(std::iter::once(binary.as_str()))
         .collect();
     println!("\nLaunching: mpirun {}\n", args.join(" "));
 
@@ -166,9 +184,108 @@ fn run(mut passthrough: Vec<String>) -> Result<(), Box<dyn Error>> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
+/// Start N local containers on a private bridge network and run the demo inside them.
+fn local(image: String, count: usize, binary: String) -> Result<(), Box<dyn Error>> {
+    const NETWORK: &str = "mpi-local";
+    let names: Vec<String> = (0..count).map(|i| format!("mpi-local-{i}")).collect();
+
+    let outcome = run_local_demo(&names, &image, &binary, count, NETWORK);
+
+    print!("\nContainers are still running. Press Enter to stop them and clean up... ");
+    let _ = io::stdout().flush();
+    let _ = io::stdin().lock().read_line(&mut String::new());
+
+    println!("Cleaning up...");
+    for name in &names {
+        let _ = Command::new("docker").args(["stop", name]).output();
+    }
+    let _ = Command::new("docker").args(["network", "rm", NETWORK]).output();
+
+    match outcome {
+        Ok(code) => std::process::exit(code),
+        Err(e) => Err(e),
+    }
+}
+
+fn run_local_demo(
+    names: &[String],
+    image: &str,
+    binary: &str,
+    count: usize,
+    network: &str,
+) -> Result<i32, Box<dyn Error>> {
+    // Remove any leftover network from a previous crashed run.
+    let _ = Command::new("docker").args(["network", "rm", network]).output();
+
+    println!("Creating Docker network '{network}'...");
+    if !Command::new("docker")
+        .args(["network", "create", network])
+        .status()?
+        .success()
+    {
+        return Err("docker network create failed".into());
+    }
+
+    println!("Starting {count} containers from '{image}'...");
+    for name in names {
+        if !Command::new("docker")
+            .args([
+                "run", "-d",
+                "--name", name,
+                "--hostname", name,
+                "--network", network,
+                "--rm",
+                image,
+                "sh", "-c", "touch /tmp/demo.log && exec tail -n +1 -f /tmp/demo.log",
+            ])
+            .status()?
+            .success()
+        {
+            return Err(format!("failed to start container '{name}'").into());
+        }
+        println!("  started {name}");
+    }
+
+    // Give sshd time to come up in every container.
+    println!("Waiting for sshd...");
+    thread::sleep(Duration::from_secs(2));
+
+    // Write the hostfile into the coordinator via stdin so we avoid shell-escaping issues.
+    let mut child = Command::new("docker")
+        .args(["exec", "-i", &names[0], "sh", "-c", "cat > /tmp/mpi-hosts"])
+        .stdin(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        for name in names {
+            writeln!(stdin, "{name} slots=1")?;
+        }
+    }
+    child.wait()?;
+
+    // Run mpirun inside the coordinator as the `mpi` user (OpenMPI refuses root).
+    // The SSH client config baked into the image already sets port 2222,
+    // StrictHostKeyChecking=no, and UserKnownHostsFile=/dev/null.
+    // Each container's CMD is `tail -n +1 -f /tmp/demo.log`, so its output is
+    // visible in Docker Desktop without the launcher needing to stream it.
+    let np = count.to_string();
+    println!("Launching: mpirun -np {np} {binary}\n");
+    let status = Command::new("docker")
+        .args([
+            "exec", "-u", "mpi", &names[0],
+            "mpirun",
+            "--hostfile", "/tmp/mpi-hosts",
+            "-np", &np,
+            binary,
+        ])
+        .status()?;
+
+    Ok(status.code().unwrap_or(1))
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     match Cli::parse().cmd {
         Cmd::Advertise => advertise(),
-        Cmd::Run { mpirun_args } => run(mpirun_args),
+        Cmd::Run { binary, mpirun_args } => run(binary, mpirun_args),
+        Cmd::Local { image, count, binary } => local(image, count, binary),
     }
 }
