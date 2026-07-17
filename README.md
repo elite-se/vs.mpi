@@ -11,16 +11,20 @@ Start the container on each machine's host network:
 docker run -it --net=host ghcr.io/elite-se/vs.mpi
 ```
 
-The launcher menu opens automatically. Students select **advertise**; the presenter selects **run**, waits until all nodes appear in the list, then presses Enter to start. Each node's log streams in the terminal and is also visible in Docker Desktop.
+The launcher menu opens automatically. Node discovery is manual:
 
-**Windows note:** Docker Desktop on Windows runs containers inside WSL2, so the IP shown inside the container may be a WSL-internal address (`192.168.65.x`) instead of the real LAN address. This breaks mDNS discovery. There are three options:
+1. Each student selects **advertise**. It prints that node's IP address — the student reads it out to the presenter and leaves it running.
+2. The presenter selects **run** and types in every node's IP (their own machine first, as rank 0), then a blank line to launch.
 
-- **Manual IP entry** — if mDNS fails, `run` falls back to a prompt where the presenter types each node's IP by hand. Students can find their LAN IP with:
-  ```powershell
-  Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass; irm https://raw.githubusercontent.com/elite-se/vs.mpi/main/get-ip.ps1 | iex
-  ```
-- **Mirrored networking** — enable mirrored networking in WSL2 to restore mDNS, see [the docs](https://learn.microsoft.com/en-us/windows/wsl/wsl-config#wslconf).
-- **Use Linux or macOS** — mDNS works out of the box on both.
+Each node's log streams in the terminal and is also visible in Docker Desktop. Press **Ctrl-C** at any point to quit.
+
+**Windows note:** Docker Desktop on Windows runs containers inside WSL2, so the address `advertise` shows may be a WSL/Docker-internal one (`172.17.x`, `192.168.65.x`) instead of the real LAN address. `advertise` flags this and reminds you to start the container with `--net=host`. On Windows/Mac host networking still can't reach the LAN, so get the real IP from the host instead:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass; irm https://raw.githubusercontent.com/elite-se/vs.mpi/main/get-ip.ps1 | iex
+```
+
+If nodes can't reach each other over the LAN at all (common with Docker Desktop on Windows), use the **Local Fallback** below instead.
 
 ### Local Fallback
 
@@ -44,15 +48,15 @@ The image bundles two components:
 3. Every rank multiplies its block locally and computes its rows of `C`
 4. Root collects the slices via `MPI_Gatherv` and logs the assembled result
 
-**Launcher** (`launcher/src/main.rs`) is an interactive mDNS-based orchestrator:
+**Launcher** (`launcher/src/main.rs`) is an interactive orchestrator:
 
 | Mode | What it does |
 |------|-------------|
-| `advertise` | Publishes this node via mDNS (`_mpi._tcp.local.`) and streams `/tmp/demo.log` |
-| `run` | Discovers LAN nodes, writes an OpenMPI hostfile (`slots=1` per host), launches `mpirun`, streams `/tmp/demo.log` from rank 0, then returns to the menu |
+| `advertise` | Prints this node's IP (warning if it looks Docker-internal), then idles so the container's sshd stays reachable and streams `/tmp/demo.log` |
+| `run` | Prompts for every node's IP, writes an OpenMPI hostfile (`slots=1` per host), launches `mpirun`, streams `/tmp/demo.log` from rank 0, then returns to the menu |
 | `local` | Creates a bridge network, starts N containers, runs the demo inside them |
 
-Nodes find each other via mDNS. SSH transport (port 2222, `StrictHostKeyChecking=no`) is pre-configured with a shared keypair so `mpirun` can reach workers without any manual setup.
+Discovery is deliberately manual: the presenter types the IPs that workers read out from `advertise`. `mpirun` then reaches the workers over SSH (port 2222, `StrictHostKeyChecking=no`), which is pre-configured with a shared keypair baked into the image so no per-node setup is needed. This keeps the launcher simple, but it does require that every node is directly reachable on the LAN — which is why the local fallback exists for Windows/Docker-Desktop setups where that isn't the case.
 
 ## SSH Key
 

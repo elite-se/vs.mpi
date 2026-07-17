@@ -1,25 +1,24 @@
 //! Launcher for the MPI demo.
 //!
-//! The presenter runs `run`, which opens a small webserver on port 8080.
-//! Workers run `advertise`, type in the presenter's IP, and hit that
-//! webserver once to register themselves; `run` reads the connecting
-//! peer's address off the socket and remembers it. No mDNS or multicast
-//! required — since containers are started with `--net=host`, the peer
-//! address the presenter observes is the worker's real LAN address.
+//! Discovery is manual: each worker runs `advertise`, which detects and prints
+//! that node's IP address (warning if it looks Docker-internal, i.e. the
+//! container was not started with `--net=host`). Workers read out their IP; the
+//! presenter runs `run` and types every node's IP by hand, then the launcher
+//! writes the OpenMPI hostfile and starts `mpirun`. `mpirun` reaches the workers
+//! over ssh, so `advertise` keeps running to hold each container (and its sshd)
+//! alive.
 //!
 //! Usage:
 //!     launcher advertise                 # on each worker node
 //!     launcher run [mpirun args...]      # on the coordinator (rank 0)
 
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::fs;
-use std::io::{self, BufRead, Read, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::io::{self, BufRead, Write};
+use std::net::UdpSocket;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use crossterm::{cursor, execute, terminal};
@@ -27,7 +26,6 @@ use crossterm::event::{read as ct_read, Event, KeyCode, KeyModifiers};
 use crossterm::style::Print;
 
 const HOSTFILE: &str = "/tmp/mpi-hosts.txt";
-const PORT: u16 = 8080;
 
 #[derive(Parser)]
 #[command(about = "launcher for the MPI demo")]
@@ -38,13 +36,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Register this node with the presenter.
-    Advertise {
-        /// IP address of the presenter (running `run`).
-        #[arg(long)]
-        presenter: Option<String>,
-    },
-    /// Discover nodes, write hostfile, launch mpirun.
+    /// Show this node's IP address and keep it reachable for the presenter.
+    Advertise,
+    /// Type in node IPs, write hostfile, launch mpirun.
     Run {
         /// MPI binary to execute on all nodes.
         #[arg(long, default_value = "./demonstration/demonstration")]
@@ -79,136 +73,102 @@ fn local_ip() -> String {
     }
 }
 
-/// Register this machine with the presenter's webserver, then idle until interrupted.
-fn advertise(presenter: Option<String>) -> Result<(), Box<dyn Error>> {
-    let presenter = match presenter {
-        Some(p) => p,
-        None => prompt_required("Presenter IP")?,
-    };
-    let ip = local_ip();
-
-    match TcpStream::connect((presenter.as_str(), PORT)) {
-        Ok(mut stream) => {
-            let _ = stream.write_all(
-                format!("GET /register HTTP/1.1\r\nHost: {presenter}\r\nConnection: close\r\n\r\n")
-                    .as_bytes(),
-            );
-            let mut buf = [0u8; 512];
-            let _ = stream.read(&mut buf);
-            println!("Registered with presenter {presenter}:{PORT} as {ip}.");
-        }
-        Err(e) => {
-            eprintln!("Could not reach presenter {presenter}:{PORT}: {e}");
+/// Heuristic: does this address look like a Docker-internal one rather than a
+/// real LAN address? A worker showing such an address almost certainly did not
+/// start the container with `--net=host` (or is on Docker Desktop, where host
+/// networking maps to the WSL/VM, not the LAN).
+fn is_container_network(ip: &str) -> bool {
+    // Docker's default address pool is 172.17.0.0 – 172.31.255.255.
+    if let Some(rest) = ip.strip_prefix("172.") {
+        if let Some((second, _)) = rest.split_once('.') {
+            if let Ok(n) = second.parse::<u8>() {
+                if (17..=31).contains(&n) {
+                    return true;
+                }
+            }
         }
     }
+    ip.starts_with("192.168.65.") // Docker Desktop (vpnkit) gateway range
+        || ip.starts_with("127.") // loopback: detection failed entirely
+}
 
+/// Print this node's IP for the presenter to type in, then idle to keep the
+/// container (and its sshd) alive so `mpirun` can reach it. Never returns.
+fn advertise() -> Result<(), Box<dyn Error>> {
+    let ip = local_ip();
+
+    if is_container_network(&ip) {
+        eprintln!("This node's address is {ip}, which looks Docker-internal.");
+        eprintln!("The container probably wasn't started with host networking. Restart it as:");
+        eprintln!("    docker run -it --net=host ghcr.io/elite-se/vs.mpi");
+        eprintln!("On Windows/Mac host networking can't reach the LAN — get your real IP from");
+        eprintln!("the host instead (see get-ip.ps1 in the README) and give that to the presenter.");
+    } else {
+        println!("This node's IP address is: {ip}");
+        println!("Give it to the presenter so they can add you.");
+        println!("(If they can't reach you, get your LAN IP from the host — see get-ip.ps1.)");
+    }
+
+    println!("\nLeave this running so the presenter can start the demo on you.");
     println!("\n--- /tmp/demo.log ---");
     thread::spawn(|| tail_log("/tmp/demo.log"));
 
-    wait_for_ctrl_c();
-    Ok(())
+    // Idle until the user interrupts; the process-wide Ctrl-C guard exits for us.
+    loop {
+        thread::sleep(Duration::from_secs(3600));
+    }
 }
 
-fn wait_for_ctrl_c() {
-    let (tx, rx) = mpsc::channel();
-    ctrlc::set_handler(move || {
-        let _ = tx.send(());
+/// Install a process-wide Ctrl-C handler that restores the terminal and exits.
+///
+/// This fires for every blocking read *outside* raw mode (prompts, the run
+/// discovery loop, the local cleanup wait). The interactive menu runs in raw
+/// mode, which disables ISIG so no SIGINT is generated — it therefore handles
+/// Ctrl-C as a plain key event itself.
+fn install_ctrl_c_guard() {
+    ctrlc::set_handler(|| {
+        let _ = terminal::disable_raw_mode();
+        let _ = execute!(io::stdout(), cursor::Show);
+        std::process::exit(130);
     })
     .expect("failed to set Ctrl-C handler");
-    let _ = rx.recv();
 }
 
-/// Discover nodes, write the hostfile, and launch mpirun.
+/// Collect node IPs by hand, write the hostfile, and launch mpirun.
 fn run(binary: String, mut passthrough: Vec<String>) -> Result<(), Box<dyn Error>> {
-    let listener = TcpListener::bind(("0.0.0.0", PORT))?;
-    let (reg_tx, reg_rx) = mpsc::channel::<String>();
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let peer = stream.peer_addr().ok().map(|a| a.ip().to_string());
-            let mut buf = [0u8; 512];
-            let _ = stream.read(&mut buf);
-            let _ = stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
-            );
-            if let Some(ip) = peer {
-                let _ = reg_tx.send(ip);
-            }
-        }
-    });
-
-    // Signal when the user presses Enter.
-    let (enter_tx, enter_rx) = mpsc::channel::<()>();
-    thread::spawn(move || {
-        let mut line = String::new();
-        let _ = io::stdin().lock().read_line(&mut line);
-        let _ = enter_tx.send(());
-    });
-
-    let me = local_ip();
-    let mut discovered: BTreeSet<String> = BTreeSet::new();
-
-    println!("Listening on 0.0.0.0:{PORT} — tell each worker to `advertise` to {me}.");
-    println!("Press Enter when all nodes are visible.\n");
-
-    let mut prev_lines: u16 = 0;
-    loop {
-        // Drain registrations for up to one second.
-        let tick = Instant::now() + Duration::from_secs(1);
-        loop {
-            let now = Instant::now();
-            if now >= tick { break; }
-            match reg_rx.recv_timeout(tick - now) {
-                Ok(ip) => {
-                    discovered.insert(ip);
-                }
-                Err(_) => break,
-            }
-        }
-
-        // Redraw the node list in-place using MoveUp so we don't rely on
-        // SavePosition/RestorePosition (\x1B7/\x1B8), which aren't forwarded
-        // reliably through Docker's PTY proxy on Windows.
-        let peers: Vec<&String> = discovered.iter().filter(|h| *h != &me).collect();
-        if prev_lines > 0 {
-            execute!(io::stdout(),
-                cursor::MoveUp(prev_lines),
-                cursor::MoveToColumn(0),
-                terminal::Clear(terminal::ClearType::FromCursorDown)
-            )?;
-        }
-        println!("  ● {me}  (you)");
-        for p in &peers {
-            println!("  ○ {p}");
-        }
-        println!();
-        print!("  {} node(s) — press Enter to start", 1 + peers.len());
-        let _ = io::stdout().flush();
-        // 1 (me) + peers.len() + 1 (blank) lines sit above the cursor.
-        prev_lines = peers.len() as u16 + 2;
-
-        if enter_rx.try_recv().is_ok() {
-            println!("\n");
-            break;
-        }
+    // This machine is rank 0, so it must come first. Offer its detected IP as a
+    // hint, but the presenter types every address (each worker reads out its own
+    // via `advertise`).
+    let detected = local_ip();
+    println!("Enter the IP of every node, one per line; blank line when done.");
+    println!("Put THIS machine (rank 0) first.");
+    if is_container_network(&detected) {
+        println!("(This machine's detected address {detected} looks like it is a docker internal one — use its real LAN IP.)\n");
+    } else {
+        println!("(This machine's detected IP is {detected}.)\n");
     }
 
-    // Allow the presenter to add any nodes that failed to register (e.g. blocked port).
-    println!("Add missing node IPs (one per line, blank to continue):");
+    let mut hosts: Vec<String> = Vec::new();
     loop {
-        print!("  IP: ");
-        let _ = io::stdout().flush();
+        print!("  IP {}: ", hosts.len() + 1);
+        io::stdout().flush()?;
         let mut line = String::new();
         io::stdin().lock().read_line(&mut line)?;
         let ip = line.trim().to_string();
-        if ip.is_empty() { break; }
-        discovered.insert(ip);
+        if ip.is_empty() {
+            break;
+        }
+        if hosts.contains(&ip) {
+            eprintln!("  (already added)");
+        } else {
+            hosts.push(ip);
+        }
     }
 
-    // This machine is rank 0, so it goes first; then every discovered peer.
-    let me = local_ip();
-    let mut hosts = vec![me.clone()];
-    hosts.extend(discovered.into_iter().filter(|h| *h != me));
+    if hosts.is_empty() {
+        eprintln!("No nodes entered — nothing to run.");
+        return Ok(());
+    }
 
     fs::write(
         HOSTFILE,
@@ -396,8 +356,8 @@ fn prompt_required(label: &str) -> Result<String, Box<dyn Error>> {
 
 fn interactive_menu(initial_sel: usize) -> Result<Cmd, Box<dyn Error>> {
     const OPTIONS: &[(&str, &str)] = &[
-        ("advertise", "Register this node with the presenter"),
-        ("run",       "Wait for nodes to register and launch mpirun"),
+        ("advertise", "Show this node's IP for the presenter"),
+        ("run",       "Type in node IPs and launch mpirun"),
         ("local",     "Start local Docker containers (fallback demo)"),
     ];
 
@@ -459,10 +419,7 @@ fn interactive_menu(initial_sel: usize) -> Result<Cmd, Box<dyn Error>> {
     println!("\r\n");
 
     match selected {
-        0 => {
-            let presenter = prompt_required("Presenter IP")?;
-            Ok(Cmd::Advertise { presenter: Some(presenter) })
-        }
+        0 => Ok(Cmd::Advertise),
         1 => {
             let binary = prompt("Binary", "./demonstration/demonstration")?;
             let args_str = prompt("Extra mpirun args (space-separated, blank for none)", "")?;
@@ -488,6 +445,8 @@ fn interactive_menu(initial_sel: usize) -> Result<Cmd, Box<dyn Error>> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    install_ctrl_c_guard();
+
     let mut cmd = match Cli::parse().cmd {
         Some(cmd) => cmd,
         None => {
@@ -502,7 +461,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     loop {
         match cmd {
-            Cmd::Advertise { presenter } => return advertise(presenter),
+            Cmd::Advertise => return advertise(),
             Cmd::Run { binary, mpirun_args } => {
                 run(binary, mpirun_args)?;
                 cmd = interactive_menu(1)?;
