@@ -37,7 +37,8 @@ The problem size is set by the `M`, `K`, and `N` constants in `message.rs`.
 | `demonstration/` | The MPI program itself (root, worker, matrix helpers, packed messages). |
 | `launcher/` | Optional mDNS helper that discovers nodes on a LAN and launches `mpirun`. |
 | `Dockerfile` | Rust + OpenMPI + sshd image; also used as the devcontainer. |
-| `docker-entrypoint.sh` | Starts `sshd`, then drops from root to the `mpi` user. |
+| `docker-setup-ssh.sh` | Build-time: installs the shared keypair from the build secret. |
+| `docker-entrypoint.sh` | Runtime: starts `sshd`, then drops from root to the `mpi` user. |
 | `.github/workflows/docker.yml` | Builds the image and pushes it to GHCR. |
 
 ## Running it
@@ -61,6 +62,17 @@ size first. A single container needs no SSH — `mpirun` forks the ranks locally
 
 `.devcontainer/devcontainer.json` builds the same `Dockerfile`, so "Reopen in
 Container" in VS Code gives you the toolchain plus rust-analyzer.
+
+The build needs the `ssh_private_key` secret (see [below](#the-demo-ssh-key)), so
+you need a copy of the private key at `ssh/id_ed25519` first, and the devcontainer
+build has to pass it through:
+
+```jsonc
+"build": {
+    "dockerfile": "../Dockerfile",
+    "options": ["--secret", "id=ssh_private_key,src=ssh/id_ed25519"]
+}
+```
 
 ### Locally
 
@@ -134,15 +146,29 @@ can pull the image can extract the private key.
 That is fine for a throwaway classroom demo, and it is the reason the containers trust
 each other out of the box. Do not reuse this keypair anywhere else.
 
-To build the image yourself:
+The key is **not** optional and the build will not invent one, because two images
+built from different keys produce nodes that cannot ssh to each other — a failure
+that would otherwise only show up at `mpirun` time. Every build must be given the
+same key:
 
 ```sh
-ssh-keygen -t ed25519 -N "" -f ssh/id_ed25519
 docker build --secret id=ssh_private_key,src=ssh/id_ed25519 -t mpi-demo .
 ```
 
-`ssh/` is git-ignored and Docker-ignored, so the key never lands in the repo or the
-build context.
+To start over with a fresh key, generate one and update the CI secret to match, or
+CI images and local images will no longer interoperate:
+
+```sh
+ssh-keygen -t ed25519 -N "" -C mpi-demo-key -f ssh/id_ed25519
+gh secret set MPI_SSH_PRIVATE_KEY < ssh/id_ed25519
+```
+
+Set the secret from the file as shown rather than pasting it: a paste can drop the
+key's trailing newline, which OpenSSH rejects as `invalid format`.
+
+`ssh/id_ed25519` is git-ignored and Docker-ignored, so the private key never lands in
+the repo or the build context — it lives only in the CI secret and on your machine.
+Keep a copy somewhere safe; it cannot be recovered from the tracked public key.
 
 ## CI
 
