@@ -61,3 +61,6 @@ CI writes the secret to `ssh/id_ed25519` before building, so the key in the imag
 ## CI
 
 `.github/workflows/docker.yml` builds for `linux/amd64` and `linux/arm64` and pushes a multi-arch manifest to `ghcr.io/elite-se/vs.mpi` on every push.
+
+## License
+[MIT](LICENSE).
