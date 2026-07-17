@@ -30,6 +30,16 @@ if ! ssh-keygen -y -f "$ssh_dir/id_ed25519" > "$ssh_dir/id_ed25519.pub"; then
     echo 'ERROR: the ssh_private_key build secret is not a valid OpenSSH private key.' >&2
     echo '       Set it from the file rather than pasting it:' >&2
     echo '       gh secret set MPI_SSH_PRIVATE_KEY < ssh/id_ed25519' >&2
+    # Shape only, never key material: the BEGIN/END markers are not secret, and
+    # the line count is what distinguishes a mangled key from a wrong one. An
+    # ed25519 key is ~8 lines; one long line means the newlines were eaten.
+    # Lines are truncated to 40 chars: that shows the BEGIN/END markers in full
+    # while making sure a key whose newlines were eaten cannot print itself here.
+    echo '       --- what arrived (truncated, no key material) ---' >&2
+    echo "       bytes: $(wc -c < "$ssh_dir/id_ed25519" | tr -d ' ')" >&2
+    echo "       lines: $(wc -l < "$ssh_dir/id_ed25519" | tr -d ' ')" >&2
+    echo "       first: [$(head -n 1 "$ssh_dir/id_ed25519" | cut -c 1-40)]" >&2
+    echo "       last:  [$(tail -n 1 "$ssh_dir/id_ed25519" | cut -c 1-40)]" >&2
     exit 1
 fi
 
