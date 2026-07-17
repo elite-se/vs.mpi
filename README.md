@@ -1,93 +1,63 @@
-# MPI demonstration
+# MPI Demonstration
 
-A teaching demo of distributed matrix multiplication with [OpenMPI](https://www.open-mpi.org/),
-written in C. Built for the *Konzepte verteilter Systeme* course at the University of Augsburg.
+Teaching demo of distributed matrix multiplication (`C = A × B`) using OpenMPI collective operations, built for *Konzepte verteilter Systeme* at the University of Augsburg.
 
-## Distributed Demo
+## Usage
+### Distributed Demo
 
-Start the container on the hosts network:
+Start the container on each machine's host network:
+
 ```sh
 docker run -it --net=host ghcr.io/elite-se/vs.mpi
 ```
 
-The container will spawn into the launcher, here the students need to select "advertise" and the presenter "run".
+The launcher menu opens automatically. Students select **advertise**; the presenter selects **run**, waits until all nodes appear in the list, then presses Enter to start. Each node's log streams in the terminal and is also visible in Docker Desktop.
 
-## What it does
+### Local Fallback
 
-Computes `C = A × B` (6×4 times 4×5) across all MPI ranks using collective operations:
-
-- **Root (rank 0)** broadcasts `B` to everyone, scatters rows of `A`, gathers the result blocks, and logs the full matrices.
-- **Workers** each receive their row-block of `A`, compute their slice of `C`, send it back, and log what they received and produced.
-
-Every rank writes its output to `/tmp/demo.log` inside its container, which is visible in Docker Desktop.
-
-## Layout
-
-| Path | What it is |
-| --- | --- |
-| `demonstration/` | The MPI demo in C (`main.c` + `Makefile`). |
-| `launcher/` | mDNS helper that discovers LAN nodes and launches `mpirun`; also has a local Docker mode. |
-| `ssh/id_ed25519` | Shared keypair baked into the image so containers can SSH to each other. |
-| `Dockerfile` | Builds the demo binary, the launcher, and sets up SSH. |
-| `docker-entrypoint.sh` | Starts `sshd` on port 2222, then drops to the `mpi` user. |
-
-## Running it
-
-### Single container
+Run everything on one machine — no LAN required:
 
 ```sh
-docker run --rm -it ghcr.io/<owner>/<repo>:latest
-# inside the container:
-mpirun -np 4 /workspace/demonstration/demonstration
+docker run -it ghcr.io/elite-se/vs.mpi
+# select: local
 ```
 
-### Local Docker containers (fallback demo)
+This starts 11 containers on a private bridge network, one rank each. Logs are visible per-container in Docker Desktop.
 
-Run 10 containers on one machine — no LAN required. Runs from the host:
+## How it works
 
-```sh
-launcher local --image ghcr.io/<owner>/<repo>:latest
-```
+The image bundles two components:
 
-Each container's log is visible in Docker Desktop. Press Enter when done to stop everything.
+**Demonstration** (`demonstration/main.c`) computes `C = A × B` (6×4 × 4×5) in four steps:
 
-### Distributed over a LAN
+1. Root builds `A` and `B`, then broadcasts `B` to all ranks via `MPI_Bcast`
+2. Root distributes row-blocks of `A` via `MPI_Scatterv` — each rank gets a contiguous slice
+3. Every rank multiplies its block locally and computes its rows of `C`
+4. Root collects the slices via `MPI_Gatherv` and logs the assembled result
 
-On each worker machine, advertise over mDNS:
+**Launcher** (`launcher/src/main.rs`) is an interactive mDNS-based orchestrator:
 
-```sh
-launcher advertise
-```
+| Mode | What it does |
+|------|-------------|
+| `advertise` | Publishes this node via mDNS (`_mpi._tcp.local.`) and streams `/tmp/demo.log` |
+| `run` | Discovers LAN nodes, writes an OpenMPI hostfile (`slots=1` per host), launches `mpirun`, streams `/tmp/demo.log` from rank 0, then returns to the menu |
+| `local` | Creates a bridge network, starts N containers, runs the demo inside them |
 
-On the coordinator:
+Nodes find each other via mDNS. SSH transport (port 2222, `StrictHostKeyChecking=no`) is pre-configured with a shared keypair so `mpirun` can reach workers without any manual setup.
 
-```sh
-launcher run
-```
+## SSH Key
 
-The launcher discovers peers for 5 s (override with `DISCOVER_SECS`), writes a hostfile, and launches `mpirun`. Pass extra flags before the binary:
+The keypair in `ssh/` is baked into every image. **It is not a secret** — do not reuse it outside this demo.
 
-```sh
-launcher run --mca btl_tcp_if_include 192.168.1.0/24
-```
-
-## SSH key
-
-The keypair in `ssh/` is baked into every image so containers can SSH to each other without manual setup. **It is not a secret** — anyone with the image can extract it. Do not reuse it outside this demo.
-
-To regenerate (e.g. after a leak):
+To regenerate:
 
 ```sh
 ssh-keygen -t ed25519 -N "" -f ssh/id_ed25519
 gh secret set SSH_PRIVATE_KEY < ssh/id_ed25519
 ```
 
-CI reads `SSH_PRIVATE_KEY` from the repository secret and writes it to `ssh/id_ed25519` before building.
+CI writes the secret to `ssh/id_ed25519` before building, so the key in the image is always current.
 
 ## CI
 
-`.github/workflows/docker.yml` builds for `linux/amd64` and `linux/arm64` on native runners and pushes a multi-arch manifest to `ghcr.io/<owner>/<repo>` on every branch push and tag.
-
-## License
-
-[MIT](LICENSE).
+`.github/workflows/docker.yml` builds for `linux/amd64` and `linux/arm64` and pushes a multi-arch manifest to `ghcr.io/elite-se/vs.mpi` on every push.
