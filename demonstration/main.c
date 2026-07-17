@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* Problem size: A is (M x K), B is (K x N), so C = A * B is (M x N). */
 #define M 6
@@ -55,6 +56,11 @@ int main(int argc, char **argv)
     /* Every rank logs to its own /tmp/demo.log so `tail -f` can follow output. */
     freopen("/tmp/demo.log", "a", stdout);
     setvbuf(stdout, NULL, _IOLBF, 0); /* line-buffered: each printf flushes immediately */
+
+    /* Print some debug information */
+    char hostname[256];
+    gethostname(hostname, sizeof(hostname));
+    printf("=== Rank %d / %d  (%s) ===\n\n", rank, size, hostname);
 
     double* a = NULL;
     double b[K * N];

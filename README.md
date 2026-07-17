@@ -7,18 +7,10 @@ written in C. Built for the *Konzepte verteilter Systeme* course at the Universi
 
 Start the container on the hosts network:
 ```sh
-docker run --net=host ghcr.io/elite-se/vs.mpi
+docker run -it --net=host ghcr.io/elite-se/vs.mpi
 ```
 
-Then advertise your node:
-```sh
-launcher advertise
-```
-
-The presenter instead runs:
-```sh
-launcher run
-```
+The container will spawn into the launcher, here the students need to select "advertise" and the presenter "run".
 
 ## What it does
 
